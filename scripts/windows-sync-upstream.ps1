@@ -76,7 +76,7 @@ if (-not $SkipChecks) {
             @("python", "-m", "hermes_cli.main", "--profile", "winfix", "doctor"),
             @("python", "-m", "hermes_cli.main", "--profile", "winfix", "profile", "list"),
             @("python", "-m", "hermes_cli.main", "--profile", "winfix", "gateway", "status"),
-            @("python", "-m", "hermes_cli.main", "--profile", "winfix", "chat", "-q", "请只回复 ok")
+            @("python", "-m", "hermes_cli.main", "--profile", "winfix", "chat", "-q", "Reply with ok only")
         )
 
         foreach ($command in $commands) {
