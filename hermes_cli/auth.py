@@ -1621,7 +1621,7 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
     if not auth_path.is_file():
         return None
     try:
-        payload = json.loads(auth_path.read_text())
+        payload = json.loads(auth_path.read_text(encoding="utf-8"))
         tokens = payload.get("tokens")
         if not isinstance(tokens, dict):
             return None
@@ -2793,7 +2793,7 @@ def _update_config_for_provider(
 
     config["model"] = model_cfg
 
-    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     return config_path
 
 
@@ -2812,7 +2812,7 @@ def _reset_config_provider() -> Path:
         model["provider"] = "auto"
         if "base_url" in model:
             model["base_url"] = OPENROUTER_BASE_URL
-    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     return config_path
 
 
