@@ -153,10 +153,6 @@ def _find_bash() -> str:
     if custom and os.path.isfile(custom):
         return custom
 
-    found = shutil.which("bash")
-    if found:
-        return found
-
     for candidate in (
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
         os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "bin", "bash.exe"),
@@ -164,6 +160,14 @@ def _find_bash() -> str:
     ):
         if candidate and os.path.isfile(candidate):
             return candidate
+
+    found = shutil.which("bash")
+    if found:
+        normalized = os.path.normcase(os.path.abspath(found))
+        # Windows exposes WSL via system32\bash.exe. Prefer Git Bash for native
+        # execution so Hermes does not silently depend on a working WSL install.
+        if normalized != os.path.normcase(r"C:\Windows\System32\bash.exe"):
+            return found
 
     raise RuntimeError(
         "Git Bash not found. Hermes Agent requires Git for Windows on Windows.\n"
@@ -199,7 +203,8 @@ def _make_run_env(env: dict) -> dict:
         elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
             run_env[k] = v
     existing_path = run_env.get("PATH", "")
-    if "/usr/bin" not in existing_path.split(":"):
+    path_entries = existing_path.split(os.pathsep) if existing_path else []
+    if not _IS_WINDOWS and "/usr/bin" not in path_entries:
         run_env["PATH"] = f"{existing_path}:{_SANE_PATH}" if existing_path else _SANE_PATH
 
     # Per-profile HOME isolation: redirect system tool configs (git, ssh, gh,

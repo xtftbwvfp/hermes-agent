@@ -93,6 +93,26 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _is_pid_alive(pid: int) -> bool:
+    try:
+        from gateway.status import _pid_exists
+        return _pid_exists(pid)
+    except Exception:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+
+
+def _terminate_pid(pid: int) -> None:
+    try:
+        from gateway.status import terminate_pid
+        terminate_pid(pid, force=False)
+    except Exception:
+        os.kill(pid, signal.SIGTERM)
+
 # Standard PATH entries for environments with minimal PATH (e.g. systemd services).
 # Includes Android/Termux and macOS Homebrew locations needed for agent-browser,
 # npx, node, and Android's glibc runner (grun).
@@ -260,31 +280,13 @@ def _resolve_cdp_override(cdp_url: str) -> str:
 
 
 def _get_cdp_override() -> str:
-    """Return a normalized CDP URL override, or empty string.
+    """Return a normalized user-supplied CDP URL override, or empty string.
 
-    Precedence is:
-    1. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
-    2. ``browser.cdp_url`` in config.yaml (persistent config)
-
-    When either is set, we skip both Browserbase and the local headless
-    launcher and connect directly to the supplied Chrome DevTools Protocol
-    endpoint.
+    When ``BROWSER_CDP_URL`` is set (e.g. via ``/browser connect``), we skip
+    both Browserbase and the local headless launcher and connect directly to
+    the supplied Chrome DevTools Protocol endpoint.
     """
-    env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
-    if env_override:
-        return _resolve_cdp_override(env_override)
-
-    try:
-        from hermes_cli.config import read_raw_config
-
-        cfg = read_raw_config()
-        browser_cfg = cfg.get("browser", {})
-        if isinstance(browser_cfg, dict):
-            return _resolve_cdp_override(str(browser_cfg.get("cdp_url", "") or ""))
-    except Exception as e:
-        logger.debug("Could not read browser.cdp_url from config: %s", e)
-
-    return ""
+    return _resolve_cdp_override(os.environ.get("BROWSER_CDP_URL", ""))
 
 
 # ============================================================================
@@ -459,38 +461,27 @@ def _emergency_cleanup_all_sessions():
     """
     Emergency cleanup of all active browser sessions.
     Called on process exit or interrupt to prevent orphaned sessions.
-
-    Also runs the orphan reaper to clean up daemons left behind by previously
-    crashed hermes processes — this way every clean hermes exit sweeps
-    accumulated orphans, not just ones that actively used the browser tool.
     """
     global _cleanup_done
     if _cleanup_done:
         return
     _cleanup_done = True
+    
+    if not _active_sessions:
+        return
+    
+    logger.info("Emergency cleanup: closing %s active session(s)...",
+                len(_active_sessions))
 
-    # Clean up this process's own sessions first, so their owner_pid files
-    # are removed before the reaper scans.
-    if _active_sessions:
-        logger.info("Emergency cleanup: closing %s active session(s)...",
-                    len(_active_sessions))
-        try:
-            cleanup_all_browsers()
-        except Exception as e:
-            logger.error("Emergency cleanup error: %s", e)
-        finally:
-            with _cleanup_lock:
-                _active_sessions.clear()
-                _session_last_activity.clear()
-                _recording_sessions.clear()
-
-    # Sweep orphans from other crashed hermes processes.  Safe even if we
-    # never used the browser — uses owner_pid liveness to avoid reaping
-    # daemons owned by other live hermes processes.
     try:
-        _reap_orphaned_browser_sessions()
+        cleanup_all_browsers()
     except Exception as e:
-        logger.debug("Orphan reap on exit failed: %s", e)
+        logger.error("Emergency cleanup error: %s", e)
+    finally:
+        with _cleanup_lock:
+            _active_sessions.clear()
+            _session_last_activity.clear()
+            _recording_sessions.clear()
 
 
 # Register cleanup via atexit only.  Previous versions installed SIGINT/SIGTERM
@@ -534,24 +525,6 @@ def _cleanup_inactive_browser_sessions():
             logger.warning("Error cleaning up inactive session %s: %s", task_id, e)
 
 
-def _write_owner_pid(socket_dir: str, session_name: str) -> None:
-    """Record the current hermes PID as the owner of a browser socket dir.
-
-    Written atomically to ``<socket_dir>/<session_name>.owner_pid`` so the
-    orphan reaper can distinguish daemons owned by a live hermes process
-    (don't reap) from daemons whose owner crashed (reap).  Best-effort —
-    an OSError here just falls back to the legacy ``tracked_names``
-    heuristic in the reaper.
-    """
-    try:
-        path = os.path.join(socket_dir, f"{session_name}.owner_pid")
-        with open(path, "w") as f:
-            f.write(str(os.getpid()))
-    except OSError as exc:
-        logger.debug("Could not write owner_pid file for %s: %s",
-                     session_name, exc)
-
-
 def _reap_orphaned_browser_sessions():
     """Scan for orphaned agent-browser daemon processes from previous runs.
 
@@ -561,19 +534,10 @@ def _reap_orphaned_browser_sessions():
 
     This function scans the tmp directory for ``agent-browser-*`` socket dirs
     left behind by previous runs, reads the daemon PID files, and kills any
-    daemons whose owning hermes process is no longer alive.
+    daemons that are still alive but not tracked by the current process.
 
-    Ownership detection priority:
-      1. ``<session>.owner_pid`` file (written by current code) — if the
-         referenced hermes PID is alive, leave the daemon alone regardless
-         of whether it's in *this* process's ``_active_sessions``.  This is
-         cross-process safe: two concurrent hermes instances won't reap each
-         other's daemons.
-      2. Fallback for daemons that predate owner_pid: check
-         ``_active_sessions`` in the current process.  If not tracked here,
-         treat as orphan (legacy behavior).
-
-    Safe to call from any context — atexit, cleanup thread, or on demand.
+    Called once on cleanup-thread startup — not every 30 seconds — to avoid
+    races with sessions being actively created.
     """
     import glob
 
@@ -586,7 +550,7 @@ def _reap_orphaned_browser_sessions():
     if not socket_dirs:
         return
 
-    # Build set of session_names currently tracked by this process (fallback path)
+    # Build set of session_names currently tracked by this process
     with _cleanup_lock:
         tracked_names = {
             info.get("session_name")
@@ -602,61 +566,31 @@ def _reap_orphaned_browser_sessions():
         if not session_name:
             continue
 
-        # Ownership check: prefer owner_pid file (cross-process safe).
-        owner_pid_file = os.path.join(socket_dir, f"{session_name}.owner_pid")
-        owner_alive: Optional[bool] = None  # None = owner_pid missing/unreadable
-        if os.path.isfile(owner_pid_file):
-            try:
-                owner_pid = int(Path(owner_pid_file).read_text().strip())
-                try:
-                    os.kill(owner_pid, 0)
-                    owner_alive = True
-                except ProcessLookupError:
-                    owner_alive = False
-                except PermissionError:
-                    # Owner exists but we can't signal it (different uid).
-                    # Treat as alive — don't reap someone else's session.
-                    owner_alive = True
-            except (ValueError, OSError):
-                owner_alive = None  # corrupt file — fall through
-
-        if owner_alive is True:
-            # Owner is alive — this session belongs to a live hermes process.
+        # Skip sessions that we are actively tracking
+        if session_name in tracked_names:
             continue
 
-        if owner_alive is None:
-            # No owner_pid file (legacy daemon).  Fall back to in-process
-            # tracking: if this process knows about the session, leave alone.
-            if session_name in tracked_names:
-                continue
-
-        # owner_alive is False (dead owner) OR legacy daemon not tracked here.
         pid_file = os.path.join(socket_dir, f"{session_name}.pid")
         if not os.path.isfile(pid_file):
-            # No daemon PID file — just a stale dir, remove it
+            # No PID file — just a stale dir, remove it
             shutil.rmtree(socket_dir, ignore_errors=True)
             continue
 
         try:
-            daemon_pid = int(Path(pid_file).read_text().strip())
+            daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
         except (ValueError, OSError):
             shutil.rmtree(socket_dir, ignore_errors=True)
             continue
 
         # Check if the daemon is still alive
-        try:
-            os.kill(daemon_pid, 0)  # signal 0 = existence check
-        except ProcessLookupError:
+        if not _is_pid_alive(daemon_pid):
             # Already dead, just clean up the dir
             shutil.rmtree(socket_dir, ignore_errors=True)
             continue
-        except PermissionError:
-            # Alive but owned by someone else — leave it alone
-            continue
 
-        # Daemon is alive and its owner is dead (or legacy + untracked).  Reap.
+        # Daemon is alive and not tracked — orphan. Kill it.
         try:
-            os.kill(daemon_pid, signal.SIGTERM)
+            _terminate_pid(daemon_pid)
             logger.info("Reaped orphaned browser daemon PID %d (session %s)",
                         daemon_pid, session_name)
             reaped += 1
@@ -1168,9 +1102,6 @@ def _run_browser_command(
             f"agent-browser-{session_info['session_name']}"
         )
         os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
-        # Record this hermes PID as the session owner (cross-process safe
-        # orphan detection — see _write_owner_pid).
-        _write_owner_pid(task_socket_dir, session_info['session_name'])
         logger.debug("browser cmd=%s task=%s socket_dir=%s (%d chars)",
                      command, task_id, task_socket_dir, len(task_socket_dir))
         
@@ -2294,8 +2225,8 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
                 pid_file = os.path.join(socket_dir, f"{session_name}.pid")
                 if os.path.isfile(pid_file):
                     try:
-                        daemon_pid = int(Path(pid_file).read_text().strip())
-                        os.kill(daemon_pid, signal.SIGTERM)
+                        daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
+                        _terminate_pid(daemon_pid)
                         logger.debug("Killed daemon pid %s for %s", daemon_pid, session_name)
                     except (ProcessLookupError, ValueError, PermissionError, OSError):
                         logger.debug("Could not kill daemon pid for %s (already dead or inaccessible)", session_name)

@@ -64,17 +64,6 @@ WATCH_WINDOW_SECONDS = 10       # Rolling window length
 WATCH_OVERLOAD_KILL_SECONDS = 45  # Sustained overload duration before disabling watch
 
 
-def format_uptime_short(seconds: int) -> str:
-    s = max(0, int(seconds))
-    if s < 60:
-        return f"{s}s"
-    mins, secs = divmod(s, 60)
-    if mins < 60:
-        return f"{mins}m {secs}s"
-    hours, mins = divmod(mins, 60)
-    return f"{hours}h {mins}m"
-
-
 @dataclass
 class ProcessSession:
     """A tracked background process with output buffering."""
@@ -255,10 +244,14 @@ class ProcessRegistry:
         if not pid:
             return False
         try:
-            os.kill(pid, 0)
-            return True
-        except (ProcessLookupError, PermissionError):
-            return False
+            from gateway.status import _pid_exists
+            return _pid_exists(pid)
+        except Exception:
+            try:
+                os.kill(pid, 0)
+                return True
+            except (ProcessLookupError, PermissionError, OSError):
+                return False
 
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
         """Update recovered host-PID sessions when the underlying process has exited."""
@@ -283,7 +276,8 @@ class ProcessRegistry:
     def _terminate_host_pid(pid: int) -> None:
         """Terminate a host-visible PID without requiring the original process handle."""
         if _IS_WINDOWS:
-            os.kill(pid, signal.SIGTERM)
+            from gateway.status import terminate_pid
+            terminate_pid(pid, force=False)
             return
 
         try:
@@ -981,22 +975,12 @@ class ProcessRegistry:
         ]
         for sid in expired:
             del self._finished[sid]
-            self._completion_consumed.discard(sid)
 
         # If still over limit, remove oldest finished
         total = len(self._running) + len(self._finished)
         if total >= MAX_PROCESSES and self._finished:
             oldest_id = min(self._finished, key=lambda sid: self._finished[sid].started_at)
             del self._finished[oldest_id]
-            self._completion_consumed.discard(oldest_id)
-
-        # Drop any _completion_consumed entries whose sessions are no longer
-        # tracked at all — belt-and-suspenders against module-lifetime growth
-        # on process-registry lookup paths that don't reach the dict prunes.
-        tracked = self._running.keys() | self._finished.keys()
-        stale = self._completion_consumed - tracked
-        if stale:
-            self._completion_consumed -= stale
 
     # ----- Checkpoint (crash recovery) -----
 

@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional
 
+_IS_WINDOWS = os.name == "nt"
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 # Directories bootstrapped inside every new profile
@@ -149,7 +150,22 @@ def _get_active_profile_path() -> Path:
 
 def _get_wrapper_dir() -> Path:
     """Return the directory for wrapper scripts."""
+    if _IS_WINDOWS:
+        return _get_default_hermes_home() / "bin"
     return Path.home() / ".local" / "bin"
+
+
+def _get_wrapper_path(name: str) -> Path:
+    """Return the wrapper path for a profile alias."""
+    wrapper_dir = _get_wrapper_dir()
+    return wrapper_dir / (f"{name}.cmd" if _IS_WINDOWS else name)
+
+
+def _wrapper_contents(profile_name: str) -> str:
+    """Return wrapper script contents for the target profile."""
+    if _IS_WINDOWS:
+        return f"@echo off\r\nhermes -p {profile_name} %*\r\n"
+    return f'#!/bin/sh\nexec hermes -p {profile_name} "$@"\n'
 
 
 # ---------------------------------------------------------------------------
@@ -196,17 +212,19 @@ def check_alias_collision(name: str) -> Optional[str]:
         return f"'{name}' conflicts with a hermes subcommand"
 
     # Check existing commands in PATH
-    wrapper_dir = _get_wrapper_dir()
+    wrapper_path = _get_wrapper_path(name)
+    lookup_name = f"{name}.cmd" if _IS_WINDOWS else name
     try:
         result = subprocess.run(
-            ["which", name], capture_output=True, text=True, timeout=5,
+            ["where" if _IS_WINDOWS else "which", lookup_name],
+            capture_output=True, text=True, timeout=5,
         )
         if result.returncode == 0:
-            existing_path = result.stdout.strip()
+            existing_path = result.stdout.strip().splitlines()[0]
             # Allow overwriting our own wrappers
-            if existing_path == str(wrapper_dir / name):
+            if os.path.normcase(existing_path) == os.path.normcase(str(wrapper_path)):
                 try:
-                    content = (wrapper_dir / name).read_text()
+                    content = wrapper_path.read_text(encoding="utf-8", errors="replace")
                     if "hermes -p" in content:
                         return None  # it's our wrapper, safe to overwrite
                 except Exception:
@@ -236,10 +254,11 @@ def create_wrapper_script(name: str) -> Optional[Path]:
         print(f"⚠ Could not create {wrapper_dir}: {e}")
         return None
 
-    wrapper_path = wrapper_dir / name
+    wrapper_path = _get_wrapper_path(name)
     try:
-        wrapper_path.write_text(f'#!/bin/sh\nexec hermes -p {name} "$@"\n')
-        wrapper_path.chmod(wrapper_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        wrapper_path.write_text(_wrapper_contents(name), encoding="utf-8")
+        if not _IS_WINDOWS:
+            wrapper_path.chmod(wrapper_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
         return wrapper_path
     except OSError as e:
         print(f"⚠ Could not create wrapper at {wrapper_path}: {e}")
@@ -248,11 +267,11 @@ def create_wrapper_script(name: str) -> Optional[Path]:
 
 def remove_wrapper_script(name: str) -> bool:
     """Remove the wrapper script for a profile. Returns True if removed."""
-    wrapper_path = _get_wrapper_dir() / name
+    wrapper_path = _get_wrapper_path(name)
     if wrapper_path.exists():
         try:
             # Verify it's our wrapper before removing
-            content = wrapper_path.read_text()
+            content = wrapper_path.read_text(encoding="utf-8", errors="replace")
             if "hermes -p" in content:
                 wrapper_path.unlink()
                 return True
@@ -286,7 +305,7 @@ def _read_config_model(profile_dir: Path) -> tuple:
         return None, None
     try:
         import yaml
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
         model_cfg = cfg.get("model", {})
         if isinstance(model_cfg, str):
@@ -301,10 +320,30 @@ def _read_config_model(profile_dir: Path) -> tuple:
 def _check_gateway_running(profile_dir: Path) -> bool:
     """Check if a gateway is running for a given profile directory."""
     try:
-        from gateway.status import get_running_pid
-        return get_running_pid(profile_dir / "gateway.pid", cleanup_stale=False) is not None
-    except Exception:
+        from gateway.status import _pid_exists
+
+        data = _read_gateway_process_record(profile_dir)
+        if not data:
+            return False
+        pid = int(data["pid"])
+        return _pid_exists(pid)
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError,
+            ProcessLookupError, PermissionError, OSError):
         return False
+
+
+def _read_gateway_process_record(profile_dir: Path) -> Optional[dict]:
+    """Read gateway PID/runtime state from the profile directory."""
+    for path in (profile_dir / "gateway.pid", profile_dir / "gateway_state.json"):
+        if not path.exists():
+            continue
+        raw = path.read_text(encoding="utf-8").strip()
+        if not raw:
+            continue
+        data = json.loads(raw) if raw.startswith("{") else {"pid": int(raw)}
+        if isinstance(data, dict) and data.get("pid") is not None:
+            return data
+    return None
 
 
 def _count_skills(profile_dir: Path) -> int:
@@ -353,7 +392,7 @@ def list_profiles() -> List[ProfileInfo]:
             if not _PROFILE_ID_RE.match(name):
                 continue
             model, provider = _read_config_model(entry)
-            alias_path = wrapper_dir / name
+            alias_path = _get_wrapper_path(name)
             profiles.append(ProfileInfo(
                 name=name,
                 path=entry,
@@ -638,30 +677,26 @@ def _cleanup_gateway_service(name: str, profile_dir: Path) -> None:
 
 def _stop_gateway_process(profile_dir: Path) -> None:
     """Stop a running gateway process via its PID file."""
-    import signal as _signal
     import time as _time
 
-    pid_file = profile_dir / "gateway.pid"
-    if not pid_file.exists():
-        return
-
     try:
-        raw = pid_file.read_text().strip()
-        data = json.loads(raw) if raw.startswith("{") else {"pid": int(raw)}
+        from gateway.status import _pid_exists, terminate_pid
+
+        data = _read_gateway_process_record(profile_dir)
+        if not data:
+            return
         pid = int(data["pid"])
-        os.kill(pid, _signal.SIGTERM)
+        terminate_pid(pid, force=False)
         # Wait up to 10s for graceful shutdown
         for _ in range(20):
             _time.sleep(0.5)
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if not _pid_exists(pid):
                 print(f"✓ Gateway stopped (PID {pid})")
                 return
         # Force kill
         try:
-            os.kill(pid, _signal.SIGKILL)
-        except ProcessLookupError:
+            terminate_pid(pid, force=True)
+        except (ProcessLookupError, OSError):
             pass
         print(f"✓ Gateway force-stopped (PID {pid})")
     except (ProcessLookupError, PermissionError):
@@ -681,7 +716,7 @@ def get_active_profile() -> str:
     """
     path = _get_active_profile_path()
     try:
-        name = path.read_text().strip()
+        name = path.read_text(encoding="utf-8").strip()
         if not name:
             return "default"
         return name
@@ -709,7 +744,7 @@ def set_active_profile(name: str) -> None:
     else:
         # Atomic write
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(name + "\n")
+        tmp.write_text(name + "\n", encoding="utf-8")
         tmp.replace(path)
 
 

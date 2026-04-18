@@ -24,19 +24,10 @@ import signal
 import tempfile
 import threading
 import time
-from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List
-
-# --- Agent cache tuning ---------------------------------------------------
-# Bounds the per-session AIAgent cache to prevent unbounded growth in
-# long-lived gateways (each AIAgent holds LLM clients, tool schemas,
-# memory providers, etc.).  LRU order + idle TTL eviction are enforced
-# from _enforce_agent_cache_cap() and _session_expiry_watcher() below.
-_AGENT_CACHE_MAX_SIZE = 128
-_AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
@@ -631,13 +622,8 @@ class GatewayRunner:
         # system prompt (including memory) every turn — breaking prefix cache
         # and costing ~10x more on providers with prompt caching (Anthropic).
         # Key: session_key, Value: (AIAgent, config_signature_str)
-        #
-        # OrderedDict so _enforce_agent_cache_cap() can pop the least-recently-
-        # used entry (move_to_end() on cache hits, popitem(last=False) for
-        # eviction).  Hard cap via _AGENT_CACHE_MAX_SIZE, idle TTL enforced
-        # from _session_expiry_watcher().
         import threading as _threading
-        self._agent_cache: "OrderedDict[str, tuple]" = OrderedDict()
+        self._agent_cache: Dict[str, tuple] = {}
         self._agent_cache_lock = _threading.Lock()
 
         # Per-session model overrides from /model command.
@@ -709,7 +695,7 @@ class GatewayRunner:
 
     def _load_voice_modes(self) -> Dict[str, str]:
         try:
-            data = json.loads(self._VOICE_MODE_PATH.read_text())
+            data = json.loads(self._VOICE_MODE_PATH.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return {}
 
@@ -727,7 +713,8 @@ class GatewayRunner:
         try:
             self._VOICE_MODE_PATH.parent.mkdir(parents=True, exist_ok=True)
             self._VOICE_MODE_PATH.write_text(
-                json.dumps(self._voice_mode, indent=2)
+                json.dumps(self._voice_mode, indent=2),
+                encoding="utf-8",
             )
         except OSError as e:
             logger.warning("Failed to save voice modes: %s", e)
@@ -1628,7 +1615,7 @@ class GatewayRunner:
 
         path = _hermes_home / self._STUCK_LOOP_FILE
         try:
-            counts = json.loads(path.read_text()) if path.exists() else {}
+            counts = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         except Exception:
             counts = {}
 
@@ -1640,7 +1627,7 @@ class GatewayRunner:
         # (they might become active again next restart)
 
         try:
-            path.write_text(json.dumps(new_counts))
+            path.write_text(json.dumps(new_counts), encoding="utf-8")
         except Exception:
             pass
 
@@ -1658,7 +1645,7 @@ class GatewayRunner:
             return 0
 
         try:
-            counts = json.loads(path.read_text())
+            counts = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return 0
 
@@ -1704,11 +1691,11 @@ class GatewayRunner:
         if not path.exists():
             return
         try:
-            counts = json.loads(path.read_text())
+            counts = json.loads(path.read_text(encoding="utf-8"))
             if session_key in counts:
                 del counts[session_key]
                 if counts:
-                    path.write_text(json.dumps(counts))
+                    path.write_text(json.dumps(counts), encoding="utf-8")
                 else:
                     path.unlink(missing_ok=True)
         except Exception:
@@ -2116,11 +2103,6 @@ class GatewayRunner:
                             _cached_agent = self._running_agents.get(key)
                         if _cached_agent and _cached_agent is not _AGENT_PENDING_SENTINEL:
                             self._cleanup_agent_resources(_cached_agent)
-                        # Drop the cache entry so the AIAgent (and its LLM
-                        # clients, tool schemas, memory provider refs) can
-                        # be garbage-collected.  Otherwise the cache grows
-                        # unbounded across the gateway's lifetime.
-                        self._evict_cached_agent(key)
                         # Mark as flushed and persist to disk so the flag
                         # survives gateway restarts.
                         with self.session_store._lock:
@@ -2164,44 +2146,6 @@ class GatewayRunner:
                         logger.info(
                             "Session expiry done: %d flushed", _flushed,
                         )
-
-                # Sweep agents that have been idle beyond the TTL regardless
-                # of session reset policy.  This catches sessions with very
-                # long / "never" reset windows, whose cached AIAgents would
-                # otherwise pin memory for the gateway's entire lifetime.
-                try:
-                    _idle_evicted = self._sweep_idle_cached_agents()
-                    if _idle_evicted:
-                        logger.info(
-                            "Agent cache idle sweep: evicted %d agent(s)",
-                            _idle_evicted,
-                        )
-                except Exception as _e:
-                    logger.debug("Idle agent sweep failed: %s", _e)
-
-                # Periodically prune stale SessionStore entries.  The
-                # in-memory dict (and sessions.json) would otherwise grow
-                # unbounded in gateways serving many rotating chats /
-                # threads / users over long time windows.  Pruning is
-                # invisible to users — a resumed session just gets a
-                # fresh session_id, exactly as if the reset policy fired.
-                _last_prune_ts = getattr(self, "_last_session_store_prune_ts", 0.0)
-                _prune_interval = 3600.0  # once per hour
-                if time.time() - _last_prune_ts > _prune_interval:
-                    try:
-                        _max_age = int(
-                            getattr(self.config, "session_store_max_age_days", 0) or 0
-                        )
-                        if _max_age > 0:
-                            _pruned = self.session_store.prune_old_entries(_max_age)
-                            if _pruned:
-                                logger.info(
-                                    "SessionStore prune: dropped %d stale entries",
-                                    _pruned,
-                                )
-                    except Exception as _e:
-                        logger.debug("SessionStore prune failed: %s", _e)
-                    self._last_session_store_prune_ts = time.time()
             except Exception as e:
                 logger.debug("Session expiry watcher error: %s", e)
             # Sleep in small increments so we can stop quickly
@@ -2408,7 +2352,6 @@ class GatewayRunner:
 
             self.adapters.clear()
             self._running_agents.clear()
-            self._running_agents_ts.clear()
             self._pending_messages.clear()
             self._pending_approvals.clear()
             if hasattr(self, '_busy_ack_ts'):
@@ -2432,20 +2375,6 @@ class GatewayRunner:
                 cleanup_all_browsers()
             except Exception:
                 pass
-
-            # Close SQLite session DBs so the WAL write lock is released.
-            # Without this, --replace and similar restart flows leave the
-            # old gateway's connection holding the WAL lock until Python
-            # actually exits — causing 'database is locked' errors when
-            # the new gateway tries to open the same file.
-            for _db_holder in (self, getattr(self, "session_store", None)):
-                _db = getattr(_db_holder, "_db", None) if _db_holder else None
-                if _db is None or not hasattr(_db, "close"):
-                    continue
-                try:
-                    _db.close()
-                except Exception as _e:
-                    logger.debug("SessionDB close error: %s", _e)
 
             from gateway.status import remove_pid_file
             remove_pid_file()
@@ -2690,9 +2619,6 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
         }
-        platform_group_env_map = {
-            Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
-        }
         platform_allow_all_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
             Platform.DISCORD: "DISCORD_ALLOW_ALL_USERS",
@@ -2717,28 +2643,6 @@ class GatewayRunner:
         if platform_allow_all_var and os.getenv(platform_allow_all_var, "").lower() in ("true", "1", "yes"):
             return True
 
-        # Discord bot senders that passed the DISCORD_ALLOW_BOTS platform
-        # filter are already authorized at the platform level — skip the
-        # user allowlist. Without this, bot messages allowed by
-        # DISCORD_ALLOW_BOTS=mentions/all would be rejected here with
-        # "Unauthorized user" (fixes #4466).
-        if source.platform == Platform.DISCORD and getattr(source, "is_bot", False):
-            allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
-            if allow_bots in ("mentions", "all"):
-                return True
-
-        # Discord role-based access (DISCORD_ALLOWED_ROLES): the adapter's
-        # on_message pre-filter already verified role membership — if the
-        # message reached here, the user passed that check. Authorize
-        # directly to avoid the "no allowlists configured" branch below
-        # rejecting role-only setups where DISCORD_ALLOWED_USERS is empty
-        # (issue #7871).
-        if (
-            source.platform == Platform.DISCORD
-            and os.getenv("DISCORD_ALLOWED_ROLES", "").strip()
-        ):
-            return True
-
         # Check pairing store (always checked, regardless of allowlists)
         platform_name = source.platform.value if source.platform else ""
         if self.pairing_store.is_approved(platform_name, user_id):
@@ -2746,22 +2650,11 @@ class GatewayRunner:
 
         # Check platform-specific and global allowlists
         platform_allowlist = os.getenv(platform_env_map.get(source.platform, ""), "").strip()
-        group_allowlist = ""
-        if source.chat_type == "group":
-            group_allowlist = os.getenv(platform_group_env_map.get(source.platform, ""), "").strip()
         global_allowlist = os.getenv("GATEWAY_ALLOWED_USERS", "").strip()
 
-        if not platform_allowlist and not group_allowlist and not global_allowlist:
+        if not platform_allowlist and not global_allowlist:
             # No allowlists configured -- check global allow-all flag
             return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes")
-
-        # Some platforms authorize group traffic by chat ID rather than sender ID.
-        if group_allowlist and source.chat_type == "group" and source.chat_id:
-            allowed_group_ids = {
-                chat_id.strip() for chat_id in group_allowlist.split(",") if chat_id.strip()
-            }
-            if "*" in allowed_group_ids or source.chat_id in allowed_group_ids:
-                return True
 
         # Check if user is in any allowlist
         allowed_ids = set()
@@ -2882,7 +2775,7 @@ class GatewayRunner:
                 response_path = _hermes_home / ".update_response"
                 try:
                     tmp = response_path.with_suffix(".tmp")
-                    tmp.write_text(response_text)
+                    tmp.write_text(response_text, encoding="utf-8")
                     tmp.replace(response_path)
                 except OSError as e:
                     logger.warning("Failed to write update response: %s", e)
@@ -2945,17 +2838,16 @@ class GatewayRunner:
                     _quick_key[:30], _stale_age, _stale_idle,
                     _raw_stale_timeout, _stale_detail,
                 )
-                self._release_running_agent_state(_quick_key)
+                del self._running_agents[_quick_key]
+                self._running_agents_ts.pop(_quick_key, None)
+                self._busy_ack_ts.pop(_quick_key, None)
 
         if _quick_key in self._running_agents:
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
 
             # Resolve the command once for all early-intercept checks below.
-            from hermes_cli.commands import (
-                resolve_command as _resolve_cmd_inner,
-                should_bypass_active_session as _should_bypass_active_inner,
-            )
+            from hermes_cli.commands import resolve_command as _resolve_cmd_inner
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
 
@@ -2976,7 +2868,8 @@ class GatewayRunner:
                 if adapter and hasattr(adapter, 'get_pending_message'):
                     adapter.get_pending_message(_quick_key)  # consume and discard
                 self._pending_messages.pop(_quick_key, None)
-                self._release_running_agent_state(_quick_key)
+                if _quick_key in self._running_agents:
+                    del self._running_agents[_quick_key]
                 logger.info("STOP for session %s — agent interrupted, session lock released", _quick_key[:20])
                 return "⚡ Stopped. You can continue this session."
 
@@ -2998,7 +2891,8 @@ class GatewayRunner:
                 self._pending_messages.pop(_quick_key, None)
                 # Clean up the running agent entry so the reset handler
                 # doesn't think an agent is still active.
-                self._release_running_agent_state(_quick_key)
+                if _quick_key in self._running_agents:
+                    del self._running_agents[_quick_key]
                 return await self._handle_reset_command(event)
 
             # /queue <prompt> — queue without interrupting
@@ -3032,28 +2926,10 @@ class GatewayRunner:
                     return await self._handle_approve_command(event)
                 return await self._handle_deny_command(event)
 
-            # /agents (/tasks alias) should be query-only and never interrupt.
-            if _cmd_def_inner and _cmd_def_inner.name == "agents":
-                return await self._handle_agents_command(event)
-
             # /background must bypass the running-agent guard — it starts a
             # parallel task and must never interrupt the active conversation.
             if _cmd_def_inner and _cmd_def_inner.name == "background":
                 return await self._handle_background_command(event)
-
-            # Gateway-handled info/control commands must never fall through to
-            # the interrupt path. If they are queued as pending text, the
-            # slash-command safety net discards them before the user sees any
-            # response.
-            if _cmd_def_inner and _should_bypass_active_inner(_cmd_def_inner.name):
-                if _cmd_def_inner.name == "help":
-                    return await self._handle_help_command(event)
-                if _cmd_def_inner.name == "commands":
-                    return await self._handle_commands_command(event)
-                if _cmd_def_inner.name == "profile":
-                    return await self._handle_profile_command(event)
-                if _cmd_def_inner.name == "update":
-                    return await self._handle_update_command(event)
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key[:20])
@@ -3093,7 +2969,8 @@ class GatewayRunner:
                 # Agent is being set up but not ready yet.
                 if event.get_command() == "stop":
                     # Force-clean the sentinel so the session is unlocked.
-                    self._release_running_agent_state(_quick_key)
+                    if _quick_key in self._running_agents:
+                        del self._running_agents[_quick_key]
                     logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key[:20])
                     return "⚡ Force-stopped. The agent was still starting — session unlocked."
                 # Queue the message so it will be picked up after the
@@ -3156,9 +3033,6 @@ class GatewayRunner:
 
         if canonical == "status":
             return await self._handle_status_command(event)
-
-        if canonical == "agents":
-            return await self._handle_agents_command(event)
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
@@ -3412,13 +3286,8 @@ class GatewayRunner:
             # (exception, command fallthrough, etc.) the sentinel must
             # not linger or the session would be permanently locked out.
             if self._running_agents.get(_quick_key) is _AGENT_PENDING_SENTINEL:
-                self._release_running_agent_state(_quick_key)
-            else:
-                # Agent path already cleaned _running_agents; make sure
-                # the paired metadata dicts are gone too.
-                self._running_agents_ts.pop(_quick_key, None)
-                if hasattr(self, "_busy_ack_ts"):
-                    self._busy_ack_ts.pop(_quick_key, None)
+                del self._running_agents[_quick_key]
+            self._running_agents_ts.pop(_quick_key, None)
 
     async def _prepare_inbound_message_text(
         self,
@@ -4615,96 +4484,6 @@ class GatewayRunner:
         ])
 
         return "\n".join(lines)
-
-    async def _handle_agents_command(self, event: MessageEvent) -> str:
-        """Handle /agents command - list active agents and running tasks."""
-        from tools.process_registry import format_uptime_short, process_registry
-
-        now = time.time()
-        current_session_key = self._session_key_for_source(event.source)
-
-        running_agents: dict = getattr(self, "_running_agents", {}) or {}
-        running_started: dict = getattr(self, "_running_agents_ts", {}) or {}
-
-        agent_rows: list[dict] = []
-        for session_key, agent in running_agents.items():
-            started = float(running_started.get(session_key, now))
-            elapsed = max(0, int(now - started))
-            is_pending = agent is _AGENT_PENDING_SENTINEL
-            agent_rows.append(
-                {
-                    "session_key": session_key,
-                    "elapsed": elapsed,
-                    "state": "starting" if is_pending else "running",
-                    "session_id": "" if is_pending else str(getattr(agent, "session_id", "") or ""),
-                    "model": "" if is_pending else str(getattr(agent, "model", "") or ""),
-                }
-            )
-
-        agent_rows.sort(key=lambda row: row["elapsed"], reverse=True)
-
-        running_processes: list[dict] = []
-        try:
-            running_processes = [
-                p for p in process_registry.list_sessions()
-                if p.get("status") == "running"
-            ]
-        except Exception:
-            running_processes = []
-
-        background_tasks = [
-            t for t in (getattr(self, "_background_tasks", set()) or set())
-            if hasattr(t, "done") and not t.done()
-        ]
-
-        lines = [
-            "🤖 **Active Agents & Tasks**",
-            "",
-            f"**Active agents:** {len(agent_rows)}",
-        ]
-
-        if agent_rows:
-            for idx, row in enumerate(agent_rows[:12], 1):
-                current = " · this chat" if row["session_key"] == current_session_key else ""
-                sid = f" · `{row['session_id']}`" if row["session_id"] else ""
-                model = f" · `{row['model']}`" if row["model"] else ""
-                lines.append(
-                    f"{idx}. `{row['session_key']}` · {row['state']} · "
-                    f"{format_uptime_short(row['elapsed'])}{sid}{model}{current}"
-                )
-            if len(agent_rows) > 12:
-                lines.append(f"... and {len(agent_rows) - 12} more")
-
-        lines.extend(
-            [
-                "",
-                f"**Running background processes:** {len(running_processes)}",
-            ]
-        )
-        if running_processes:
-            for proc in running_processes[:12]:
-                cmd = " ".join(str(proc.get("command", "")).split())
-                if len(cmd) > 90:
-                    cmd = cmd[:87] + "..."
-                lines.append(
-                    f"- `{proc.get('session_id', '?')}` · "
-                    f"{format_uptime_short(int(proc.get('uptime_seconds', 0)))} · `{cmd}`"
-                )
-            if len(running_processes) > 12:
-                lines.append(f"... and {len(running_processes) - 12} more")
-
-        lines.extend(
-            [
-                "",
-                f"**Gateway async jobs:** {len(background_tasks)}",
-            ]
-        )
-
-        if not agent_rows and not running_processes and not background_tasks:
-            lines.append("")
-            lines.append("No active agents or running tasks.")
-
-        return "\n".join(lines)
     
     async def _handle_stop_command(self, event: MessageEvent) -> str:
         """Handle /stop command - interrupt a running agent.
@@ -4724,14 +4503,16 @@ class GatewayRunner:
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:
             # Force-clean the sentinel so the session is unlocked.
-            self._release_running_agent_state(session_key)
+            if session_key in self._running_agents:
+                del self._running_agents[session_key]
             logger.info("STOP (pending) for session %s — sentinel cleared", session_key[:20])
             return "⚡ Stopped. The agent hadn't started yet — you can continue this session."
         if agent:
             agent.interrupt("Stop requested")
             # Force-clean the session lock so a truly hung agent doesn't
             # keep it locked forever.
-            self._release_running_agent_state(session_key)
+            if session_key in self._running_agents:
+                del self._running_agents[session_key]
             return "⚡ Stopped. You can continue this session."
         else:
             return "No active task to stop."
@@ -4755,7 +4536,7 @@ class GatewayRunner:
             if event.source.thread_id:
                 notify_data["thread_id"] = event.source.thread_id
             (_hermes_home / ".restart_notify.json").write_text(
-                _json.dumps(notify_data)
+                _json.dumps(notify_data), encoding="utf-8"
             )
         except Exception as e:
             logger.debug("Failed to write restart notify file: %s", e)
@@ -6017,7 +5798,7 @@ class GatewayRunner:
                         pass
 
                 # Send media files
-                for media_path, _is_voice in (media_files or []):
+                for media_path in (media_files or []):
                     try:
                         await adapter.send_document(
                             chat_id=source.chat_id,
@@ -6195,7 +5976,7 @@ class GatewayRunner:
                 except Exception:
                     pass
 
-            for media_path, _is_voice in (media_files or []):
+            for media_path in (media_files or []):
                 try:
                     await adapter.send_file(chat_id=source.chat_id, file_path=media_path)
                 except Exception:
@@ -6647,7 +6428,8 @@ class GatewayRunner:
             logger.debug("Memory flush on resume failed: %s", e)
 
         # Clear any running agent for this session key
-        self._release_running_agent_state(session_key)
+        if session_key in self._running_agents:
+            del self._running_agents[session_key]
 
         # Switch the session entry to point at the old session
         new_entry = self.session_store.switch_session(session_key, target_id)
@@ -7108,7 +6890,7 @@ class GatewayRunner:
             except Exception as exc:
                 return f"✗ Failed to upload debug report: {exc}"
 
-            # Schedule auto-deletion after 6 hours
+            # Schedule auto-deletion after 1 hour
             _schedule_auto_delete(list(urls.values()))
 
             lines = [_GATEWAY_PRIVACY_NOTICE, "", "**Debug report uploaded:**", ""]
@@ -7117,7 +6899,7 @@ class GatewayRunner:
                 lines.append(f"`{label:<{label_width}}`  {url}")
 
             lines.append("")
-            lines.append("⏱ Pastes will auto-delete in 6 hours.")
+            lines.append("⏱ Pastes will auto-delete in 1 hour.")
             lines.append("For full log uploads, use `hermes debug share` from the CLI.")
             lines.append("Share these links with the Hermes team for support.")
             return "\n".join(lines)
@@ -7263,7 +7045,7 @@ class GatewayRunner:
         for path in (claimed_path, pending_path):
             if path.exists():
                 try:
-                    pending = json.loads(path.read_text())
+                    pending = json.loads(path.read_text(encoding="utf-8"))
                     platform_str = pending.get("platform")
                     chat_id = pending.get("chat_id")
                     session_key = pending.get("session_key")
@@ -7286,7 +7068,7 @@ class GatewayRunner:
                     return
                 await asyncio.sleep(poll_interval)
             if (pending_path.exists() or claimed_path.exists()) and not exit_code_path.exists():
-                exit_code_path.write_text("124")
+                exit_code_path.write_text("124", encoding="utf-8")
                 await self._send_update_notification()
             return
 
@@ -7324,7 +7106,7 @@ class GatewayRunner:
                 # Read any remaining output
                 if output_path.exists():
                     try:
-                        content = output_path.read_text()
+                        content = output_path.read_text(encoding="utf-8")
                         if len(content) > bytes_sent:
                             buffer += content[bytes_sent:]
                             bytes_sent = len(content)
@@ -7334,7 +7116,7 @@ class GatewayRunner:
 
                 # Send final status
                 try:
-                    exit_code_raw = exit_code_path.read_text().strip() or "1"
+                    exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
                     exit_code = int(exit_code_raw)
                     if exit_code == 0:
                         await adapter.send(chat_id, "✅ Hermes update finished.")
@@ -7462,7 +7244,7 @@ class GatewayRunner:
             elif not claimed_path.exists():
                 return True
 
-            pending = json.loads(claimed_path.read_text())
+            pending = json.loads(claimed_path.read_text(encoding="utf-8"))
             platform_str = pending.get("platform")
             chat_id = pending.get("chat_id")
 
@@ -7473,13 +7255,13 @@ class GatewayRunner:
                 claimed_path.replace(pending_path)
                 return False
 
-            exit_code_raw = exit_code_path.read_text().strip() or "1"
+            exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
             exit_code = int(exit_code_raw)
 
             # Read the captured update output
             output = ""
             if output_path.exists():
-                output = output_path.read_text()
+                output = output_path.read_text(encoding="utf-8")
 
             # Resolve adapter
             platform = Platform(platform_str)
@@ -7527,7 +7309,7 @@ class GatewayRunner:
             return
 
         try:
-            data = _json.loads(notify_path.read_text())
+            data = _json.loads(notify_path.read_text(encoding="utf-8"))
             platform_str = data.get("platform")
             chat_id = data.get("chat_id")
             thread_id = data.get("thread_id")
@@ -8063,183 +7845,12 @@ class GatewayRunner:
         override = self._session_model_overrides.get(session_key)
         return override is not None and override.get("model") == agent_model
 
-    def _release_running_agent_state(self, session_key: str) -> None:
-        """Pop ALL per-running-agent state entries for ``session_key``.
-
-        Replaces ad-hoc ``del self._running_agents[key]`` calls scattered
-        across the gateway.  Those sites had drifted: some popped only
-        ``_running_agents``; some also ``_running_agents_ts``; only one
-        path also cleared ``_busy_ack_ts``.  Each missed entry was a
-        small, persistent leak — a (str_key → float) tuple per session
-        per gateway lifetime.
-
-        Use this at every site that ends a running turn, regardless of
-        cause (normal completion, /stop, /reset, /resume, sentinel
-        cleanup, stale-eviction).  Per-session state that PERSISTS
-        across turns (``_session_model_overrides``, ``_voice_mode``,
-        ``_pending_approvals``, ``_update_prompt_pending``) is NOT
-        touched here — those have their own lifecycles.
-        """
-        if not session_key:
-            return
-        self._running_agents.pop(session_key, None)
-        self._running_agents_ts.pop(session_key, None)
-        if hasattr(self, "_busy_ack_ts"):
-            self._busy_ack_ts.pop(session_key, None)
-
     def _evict_cached_agent(self, session_key: str) -> None:
         """Remove a cached agent for a session (called on /new, /model, etc)."""
         _lock = getattr(self, "_agent_cache_lock", None)
         if _lock:
             with _lock:
                 self._agent_cache.pop(session_key, None)
-
-    def _release_evicted_agent_soft(self, agent: Any) -> None:
-        """Soft cleanup for cache-evicted agents — preserves session tool state.
-
-        Called from _enforce_agent_cache_cap and _sweep_idle_cached_agents.
-        Distinct from _cleanup_agent_resources (full teardown) because a
-        cache-evicted session may resume at any time — its terminal
-        sandbox, browser daemon, and tracked bg processes must outlive
-        the Python AIAgent instance so the next agent built for the
-        same task_id inherits them.
-        """
-        if agent is None:
-            return
-        try:
-            if hasattr(agent, "release_clients"):
-                agent.release_clients()
-            else:
-                # Older agent instance (shouldn't happen in practice) —
-                # fall back to the legacy full-close path.
-                self._cleanup_agent_resources(agent)
-        except Exception:
-            pass
-
-    def _enforce_agent_cache_cap(self) -> None:
-        """Evict oldest cached agents when cache exceeds _AGENT_CACHE_MAX_SIZE.
-
-        Must be called with _agent_cache_lock held.  Resource cleanup
-        (memory provider shutdown, tool resource close) is scheduled
-        on a daemon thread so the caller doesn't block on slow teardown
-        while holding the cache lock.
-
-        Agents currently in _running_agents are SKIPPED — their clients,
-        terminal sandboxes, background processes, and child subagents
-        are all in active use by the running turn.  Evicting them would
-        tear down those resources mid-turn and crash the request.  If
-        every candidate in the LRU order is active, we simply leave the
-        cache over the cap; it will be re-checked on the next insert.
-        """
-        _cache = getattr(self, "_agent_cache", None)
-        if _cache is None:
-            return
-        # OrderedDict.popitem(last=False) pops oldest; plain dict lacks the
-        # arg so skip enforcement if a test fixture swapped the cache type.
-        if not hasattr(_cache, "move_to_end"):
-            return
-
-        # Snapshot of agent instances that are actively mid-turn.  Use id()
-        # so the lookup is O(1) and doesn't depend on AIAgent.__eq__ (which
-        # MagicMock overrides in tests).
-        running_ids = {
-            id(a)
-            for a in getattr(self, "_running_agents", {}).values()
-            if a is not None and a is not _AGENT_PENDING_SENTINEL
-        }
-
-        # Walk LRU → MRU and evict excess-LRU entries that aren't mid-turn.
-        # We only consider entries in the first (size - cap) LRU positions
-        # as eviction candidates.  If one of those slots is held by an
-        # active agent, we SKIP it without compensating by evicting a
-        # newer entry — that would penalise a freshly-inserted session
-        # (which has no cache history to retain) while protecting an
-        # already-cached long-running one.  The cache may therefore stay
-        # temporarily over cap; it will re-check on the next insert,
-        # after active turns have finished.
-        excess = max(0, len(_cache) - _AGENT_CACHE_MAX_SIZE)
-        evict_plan: List[tuple] = []  # [(key, agent), ...]
-        if excess > 0:
-            ordered_keys = list(_cache.keys())
-            for key in ordered_keys[:excess]:
-                entry = _cache.get(key)
-                agent = entry[0] if isinstance(entry, tuple) and entry else None
-                if agent is not None and id(agent) in running_ids:
-                    continue  # active mid-turn; don't evict, don't substitute
-                evict_plan.append((key, agent))
-
-        for key, _ in evict_plan:
-            _cache.pop(key, None)
-
-        remaining_over_cap = len(_cache) - _AGENT_CACHE_MAX_SIZE
-        if remaining_over_cap > 0:
-            logger.warning(
-                "Agent cache over cap (%d > %d); %d excess slot(s) held by "
-                "mid-turn agents — will re-check on next insert.",
-                len(_cache), _AGENT_CACHE_MAX_SIZE, remaining_over_cap,
-            )
-
-        for key, agent in evict_plan:
-            logger.info(
-                "Agent cache at cap; evicting LRU session=%s (cache_size=%d)",
-                key, len(_cache),
-            )
-            if agent is not None:
-                threading.Thread(
-                    target=self._release_evicted_agent_soft,
-                    args=(agent,),
-                    daemon=True,
-                    name=f"agent-cache-evict-{key[:24]}",
-                ).start()
-
-    def _sweep_idle_cached_agents(self) -> int:
-        """Evict cached agents whose AIAgent has been idle > _AGENT_CACHE_IDLE_TTL_SECS.
-
-        Safe to call from the session expiry watcher without holding the
-        cache lock — acquires it internally.  Returns the number of entries
-        evicted.  Resource cleanup is scheduled on daemon threads.
-
-        Agents currently in _running_agents are SKIPPED for the same reason
-        as _enforce_agent_cache_cap: tearing down an active turn's clients
-        mid-flight would crash the request.
-        """
-        _cache = getattr(self, "_agent_cache", None)
-        _lock = getattr(self, "_agent_cache_lock", None)
-        if _cache is None or _lock is None:
-            return 0
-        now = time.time()
-        to_evict: List[tuple] = []
-        running_ids = {
-            id(a)
-            for a in getattr(self, "_running_agents", {}).values()
-            if a is not None and a is not _AGENT_PENDING_SENTINEL
-        }
-        with _lock:
-            for key, entry in list(_cache.items()):
-                agent = entry[0] if isinstance(entry, tuple) and entry else None
-                if agent is None:
-                    continue
-                if id(agent) in running_ids:
-                    continue  # mid-turn — don't tear it down
-                last_activity = getattr(agent, "_last_activity_ts", None)
-                if last_activity is None:
-                    continue
-                if (now - last_activity) > _AGENT_CACHE_IDLE_TTL_SECS:
-                    to_evict.append((key, agent))
-            for key, _ in to_evict:
-                _cache.pop(key, None)
-        for key, agent in to_evict:
-            logger.info(
-                "Agent cache idle-TTL evict: session=%s (idle=%.0fs)",
-                key, now - getattr(agent, "_last_activity_ts", now),
-            )
-            threading.Thread(
-                target=self._release_evicted_agent_soft,
-                args=(agent,),
-                daemon=True,
-                name=f"agent-cache-idle-{key[:24]}",
-            ).start()
-        return len(to_evict)
 
     # ------------------------------------------------------------------
     # Proxy mode: forward messages to a remote Hermes API server
@@ -8372,15 +7983,12 @@ class GatewayRunner:
                 if _adapter:
                     _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
                     _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
-                    _buffer_only = False
                     if source.platform == Platform.MATRIX:
                         _effective_cursor = ""
-                        _buffer_only = True
                     _consumer_cfg = StreamConsumerConfig(
                         edit_interval=_scfg.edit_interval,
                         buffer_threshold=_scfg.buffer_threshold,
                         cursor=_effective_cursor,
-                        buffer_only=_buffer_only,
                     )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
@@ -8946,15 +8554,12 @@ class GatewayRunner:
                         # Some Matrix clients render the streaming cursor
                         # as a visible tofu/white-box artifact.  Keep
                         # streaming text on Matrix, but suppress the cursor.
-                        _buffer_only = False
                         if source.platform == Platform.MATRIX:
                             _effective_cursor = ""
-                            _buffer_only = True
                         _consumer_cfg = StreamConsumerConfig(
                             edit_interval=_scfg.edit_interval,
                             buffer_threshold=_scfg.buffer_threshold,
                             cursor=_effective_cursor,
-                            buffer_only=_buffer_only,
                         )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
@@ -9008,13 +8613,6 @@ class GatewayRunner:
                     cached = _cache.get(session_key)
                     if cached and cached[1] == _sig:
                         agent = cached[0]
-                        # Refresh LRU order so the cap enforcement evicts
-                        # truly-oldest entries, not the one we just used.
-                        if hasattr(_cache, "move_to_end"):
-                            try:
-                                _cache.move_to_end(session_key)
-                            except KeyError:
-                                pass
                         # Reset activity timestamp so the inactivity timeout
                         # handler doesn't see stale idle time from the previous
                         # turn and immediately kill this agent.  (#9051)
@@ -9053,7 +8651,6 @@ class GatewayRunner:
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         _cache[session_key] = (agent, _sig)
-                        self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
 
             # Per-message state — callbacks and reasoning config change every
@@ -9922,8 +9519,10 @@ class GatewayRunner:
             
             # Clean up tracking
             tracking_task.cancel()
+            if session_key and session_key in self._running_agents:
+                del self._running_agents[session_key]
             if session_key:
-                self._release_running_agent_state(session_key)
+                self._running_agents_ts.pop(session_key, None)
             if self._draining:
                 self._update_runtime_status("draining")
             
@@ -10044,7 +9643,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # setups (each profile using a distinct HERMES_HOME) will naturally
     # allow concurrent instances without tripping this guard.
     import time as _time
-    from gateway.status import get_running_pid, remove_pid_file, terminate_pid
+    from gateway.status import _pid_exists, get_running_pid, remove_pid_file, terminate_pid
     existing_pid = get_running_pid()
     if existing_pid is not None and existing_pid != os.getpid():
         if replace:
@@ -10052,16 +9651,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 "Replacing existing gateway instance (PID %d) with --replace.",
                 existing_pid,
             )
-            # Record a takeover marker so the target's shutdown handler
-            # recognises its SIGTERM as a planned takeover and exits 0
-            # (rather than exit 1, which would trigger systemd's
-            # Restart=on-failure and start a flap loop against us).
-            # Best-effort — proceed even if the write fails.
-            try:
-                from gateway.status import write_takeover_marker
-                write_takeover_marker(existing_pid)
-            except Exception as e:
-                logger.debug("Could not write takeover marker: %s", e)
             try:
                 terminate_pid(existing_pid, force=False)
             except ProcessLookupError:
@@ -10071,21 +9660,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                     "Permission denied killing PID %d. Cannot replace.",
                     existing_pid,
                 )
-                # Marker is scoped to a specific target; clean it up on
-                # give-up so it doesn't grief an unrelated future shutdown.
-                try:
-                    from gateway.status import clear_takeover_marker
-                    clear_takeover_marker()
-                except Exception:
-                    pass
                 return False
             # Wait up to 10 seconds for the old process to exit
             for _ in range(20):
-                try:
-                    os.kill(existing_pid, 0)
-                    _time.sleep(0.5)
-                except (ProcessLookupError, PermissionError):
+                if not _pid_exists(existing_pid):
                     break  # Process is gone
+                _time.sleep(0.5)
             else:
                 # Still alive after 10s — force kill
                 logger.warning(
@@ -10098,13 +9678,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 except (ProcessLookupError, PermissionError, OSError):
                     pass
             remove_pid_file()
-            # Clean up any takeover marker the old process didn't consume
-            # (e.g. SIGKILL'd before its shutdown handler could read it).
-            try:
-                from gateway.status import clear_takeover_marker
-                clear_takeover_marker()
-            except Exception:
-                pass
             # Also release all scoped locks left by the old process.
             # Stopped (Ctrl+Z) processes don't release locks on exit,
             # leaving stale lock files that block the new gateway from starting.
@@ -10172,27 +9745,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Set up signal handlers
     def shutdown_signal_handler():
         nonlocal _signal_initiated_shutdown
-        # Planned --replace takeover check: when a sibling gateway is
-        # taking over via --replace, it wrote a marker naming this PID
-        # before sending SIGTERM. If present, treat the signal as a
-        # planned shutdown and exit 0 so systemd's Restart=on-failure
-        # doesn't revive us (which would flap-fight the replacer when
-        # both services are enabled, e.g. hermes.service + hermes-
-        # gateway.service from pre-rename installs).
-        planned_takeover = False
-        try:
-            from gateway.status import consume_takeover_marker_for_self
-            planned_takeover = consume_takeover_marker_for_self()
-        except Exception as e:
-            logger.debug("Takeover marker check failed: %s", e)
-
-        if planned_takeover:
-            logger.info(
-                "Received SIGTERM as a planned --replace takeover — exiting cleanly"
-            )
-        else:
-            _signal_initiated_shutdown = True
-            logger.info("Received SIGTERM/SIGINT — initiating shutdown")
+        _signal_initiated_shutdown = True
+        logger.info("Received SIGTERM/SIGINT — initiating shutdown")
         # Diagnostic: log all hermes-related processes so we can identify
         # what triggered the signal (hermes update, hermes gateway restart,
         # a stale detached subprocess, etc.).
